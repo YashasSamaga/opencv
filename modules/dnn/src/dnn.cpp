@@ -1841,6 +1841,13 @@ struct Net::Impl
             for (size_t i = 0; i < ninputs; i++)
             {
                 ld.inputBlobsWrappers[i] = wrap(netInputLayer->inputsData[i]);
+#ifdef HAVE_CUDA
+                if (IS_DNN_CUDA_TARGET(preferableTarget))
+                {
+                    auto wrapper = ld.inputBlobsWrappers[i].dynamicCast<CUDABackendWrapperFP32>();
+                    wrapper->setStream(stream);
+                }
+#endif
             }
         }
         else
@@ -1869,11 +1876,19 @@ struct Net::Impl
         for (int i = 0; i < ld.outputBlobs.size(); ++i)
         {
             ld.outputBlobsWrappers[i] = wrap(ld.outputBlobs[i]);
+#ifdef HAVE_CUDA
+            if (IS_DNN_CUDA_TARGET(preferableTarget))
+            {
+                auto wrapper = ld.outputBlobsWrappers[i].dynamicCast<CUDABackendWrapperFP32>();
+                wrapper->setStream(stream);
+            }
+#endif
         }
         ld.internalBlobsWrappers.resize(ld.internals.size());
         for (int i = 0; i < ld.internals.size(); ++i)
         {
             ld.internalBlobsWrappers[i] = wrap(ld.internals[i]);
+            /* we don't set stream for CUDA backend wrappers for internals as they are not used */
         }
 
         Ptr<Layer> layerPtr = ld.getLayerInstance();
