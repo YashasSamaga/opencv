@@ -2492,7 +2492,7 @@ struct Net::Impl : public detail::NetImplBase
         ld.flag = 1;
     }
 
-#if 0
+#if 1
 #define printf_(args) printf args
 #else
 #define printf_(args)
@@ -2726,7 +2726,7 @@ struct Net::Impl : public detail::NetImplBase
             // are concatenated implicitly).
             Ptr<ConcatLayer> concatLayer = ld.layerInstance.dynamicCast<ConcatLayer>();
             if( !concatLayer.empty() && concatLayer->axis == 1 && !concatLayer->padding &&
-                ld.outputBlobs.size() == 1 )
+                ld.outputBlobs.size() == 1 && preferableBackend != DNN_BACKEND_CUDA)
             {
                 Mat& output = ld.outputBlobs[0];
                 UMat umat_output;
@@ -2782,17 +2782,10 @@ struct Net::Impl : public detail::NetImplBase
                                layers[ld.inputBlobsId[i].lid].getLayerInstance()->name.c_str(),
                                inp_i_data->getLayerInstance()->name.c_str()));
 
+                        // TODO: `inp_i_data->consumers.size() != 1` is not strictly required
                         if(inp_i_data->skip || inp_i_data->consumers.size() != 1)
                             break;
-#ifdef HAVE_CUDA
-                        if (preferableBackend == DNN_BACKEND_CUDA &&
-                            (inp_i_data->layerInstance->supportBackend(DNN_BACKEND_CUDA) == false ||
-                             (inp_i_data->layerInstance->type != "Convolution" &&
-                              inp_i_data->layerInstance->type != "Pooling")))
-                        {
-                            break;
-                        }
-#endif
+
                         realinputs[i] = pin;
                     }
 
@@ -2810,10 +2803,6 @@ struct Net::Impl : public detail::NetImplBase
                             umats[0] = umat_output;
                             OpenCLBackendWrapper::update(ld.outputBlobsWrappers, umats);
                         }
-#endif
-#ifdef HAVE_CUDA
-                        if (preferableBackend == DNN_BACKEND_CUDA)
-                            ld.outputBlobsWrappers[0] = wrap(output);
 #endif
                         Range chrange[] = { Range::all(), Range::all(), Range::all(), Range::all() };
                         int ofs = 0;
@@ -2839,44 +2828,122 @@ struct Net::Impl : public detail::NetImplBase
                                 OpenCLBackendWrapper::update(inp_i_data->outputBlobsWrappers, umats);
                             }
 #endif
-#ifdef HAVE_CUDA
-                            if (preferableBackend == DNN_BACKEND_CUDA)
-                            {
-                                auto cuda_wrapper = wrap(output).dynamicCast<CUDABackendWrapper>();
-                                auto offset = chrange[1].start * (output.size[2] * output.size[3]);
-                                auto shape = MatShape{1, chrange[1].size(), output.size[2], output.size[3]};
-                                cuda_wrapper->update(shape, offset);
-                                inp_i_data->outputBlobsWrappers[pin.oid] = cuda_wrapper.staticCast<BackendWrapper>();
-                            }
-#endif
+
                             // Layers that refer old input Mat will refer to the
                             // new data but the same Mat object.
                             CV_Assert_N(curr_output.data == output_slice.data, oldPtr == &curr_output);
                         }
 
-#ifdef HAVE_CUDA
-                        if (preferableBackend == DNN_BACKEND_CUDA)
-                        {
-                            for (int i = 0; i < ld.consumers.size(); i++)
-                            {
-                                LayerData& consumer = layers[ld.consumers[i].lid];
-                                for (int j = 0; j < consumer.inputBlobsId.size(); j++)
-                                {
-                                    if (consumer.inputBlobsId[j].lid == ld.id)
-                                    {
-                                        CV_Assert(consumer.inputBlobs[j]->data == ld.outputBlobs[0].data);
-                                        consumer.inputBlobsWrappers[j] = ld.outputBlobsWrappers[0];
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-#endif
                         ld.skip = true;
                         printf_(("\toptimized out Concat layer %s\n", concatLayer->name.c_str()));
                     }
                 }
             }
+
+#ifdef HAVE_CUDA
+            // CUDA backend supports many more kinds of concat fusions; we handle them here separately
+            if( !concatLayer.empty() && !concatLayer->padding &&
+                ld.outputBlobs.size() == 1 && preferableBackend == DNN_BACKEND_CUDA )
+            {
+                Mat& output = ld.outputBlobs[0];
+
+                // CUDA backend does not support strided tensors, so we require axes preceeding
+                // the concat axis to be singleton to apply the optimization
+                int axis = clamp(concatLayer->axis, output.dims);
+                if( output.total(0, axis) == 1 )
+                {
+                    size_t i, ninputs = ld.inputBlobsId.size();
+                    std::vector<LayerPin> realinputs(ninputs);
+                    for( i = 0; i < ninputs; i++ )
+                    {
+                        LayerPin pin = ld.inputBlobsId[i];
+                        LayerData* inp_i_data = &layers[pin.lid];
+                        while(inp_i_data->skip &&
+                              inp_i_data->inputBlobsId.size() == 1 &&
+                              inp_i_data->consumers.size() == 1)
+                        {
+                            pin = inp_i_data->inputBlobsId[0];
+                            inp_i_data = &layers[pin.lid];
+                        }
+                        printf_(("\treal input for %s is %s\n",
+                               layers[ld.inputBlobsId[i].lid].getLayerInstance()->name.c_str(),
+                               inp_i_data->getLayerInstance()->name.c_str()));
+
+                        if(inp_i_data->skip || inp_i_data->consumers.size() != 1)
+                            break;
+
+                        if (inp_i_data->layerInstance->supportBackend(DNN_BACKEND_CUDA) == false ||
+                             (inp_i_data->layerInstance->type != "Convolution" &&
+                              inp_i_data->layerInstance->type != "Pooling" &&
+                              inp_i_data->layerInstance->type != "Resize"  &&
+                              inp_i_data->layerInstance->type != "Flatten" &&
+                              inp_i_data->layerInstance->type != "Permute" &&
+                              inp_i_data->layerInstance->type != "Reorg" &&
+                              inp_i_data->layerInstance->type != "Eltwise" &&
+                              inp_i_data->layerInstance.dynamicCast<ActivationLayer>().empty()))
+                        {
+                            break;
+                        }
+
+                        realinputs[i] = pin;
+                    }
+
+                    if( i >= ninputs )
+                    {
+                        // Allocate new memory to prevent collisions during memory
+                        // reusing (see https://github.com/opencv/opencv/pull/10456).
+                        output = output.clone();
+                        ld.outputBlobsWrappers[0] = wrap(output);
+
+                        std::vector<Range> output_shape(output.dims, Range::all());
+                        int caxis_stride = output.total(axis + 1, output.dims);
+                        int caxis_ofs = 0;
+                        for( i = 0; i < ninputs; i++ )
+                        {
+                            LayerPin pin = realinputs[i];
+                            LayerData* inp_i_data = &layers[pin.lid];
+                            int caxis_size_i = ld.inputBlobs[i]->size[axis];
+                            printf_(("\toutput %s(%d) to concat axis (%d, %d)\n", inp_i_data->layerInstance->name.c_str(),
+                                   pin.oid, caxis_ofs, caxis_ofs + caxis_size_i));
+                            output_shape[axis] = Range(caxis_ofs, caxis_ofs + caxis_size_i);
+                            caxis_ofs += caxis_size_i;
+
+                            Mat output_slice = output(output_shape);
+                            Mat& curr_output = inp_i_data->outputBlobs[pin.oid];
+                            CV_Assert(output_slice.isContinuous() && output_slice.size == curr_output.size);
+                            Mat* oldPtr = &curr_output;
+                            curr_output = output_slice;
+                            // Layers that refer old input Mat will refer to the
+                            // new data but the same Mat object.
+                            CV_Assert_N(curr_output.data == output_slice.data, oldPtr == &curr_output);
+
+                            auto cuda_wrapper = wrap(output).dynamicCast<CUDABackendWrapper>();
+                            auto offset = output_shape[axis].start * caxis_stride;
+                            auto new_shape = shape(output_slice);
+                            cuda_wrapper->update(new_shape, offset);
+                            inp_i_data->outputBlobsWrappers[pin.oid] = cuda_wrapper.staticCast<BackendWrapper>();
+                        }
+
+                        for (int i = 0; i < ld.consumers.size(); i++)
+                        {
+                            LayerData& consumer = layers[ld.consumers[i].lid];
+                            for (int j = 0; j < consumer.inputBlobsId.size(); j++)
+                            {
+                                if (consumer.inputBlobsId[j].lid == ld.id)
+                                {
+                                    CV_Assert(consumer.inputBlobs[j]->data == ld.outputBlobs[0].data);
+                                    consumer.inputBlobsWrappers[j] = ld.outputBlobsWrappers[0];
+                                    break;
+                                }
+                            }
+                        }
+
+                        ld.skip = true;
+                        printf_(("\toptimized out Concat layer %s\n", concatLayer->name.c_str()));
+                    }
+                }
+            }
+#endif
         }
     }
 
