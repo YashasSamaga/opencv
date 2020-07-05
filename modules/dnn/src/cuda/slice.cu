@@ -15,6 +15,8 @@
 #include "../cuda4dnn/csl/tensor.hpp"
 #include "../cuda4dnn/csl/span.hpp"
 
+#include "../cuda4dnn/kernels/fill_copy.hpp"
+
 #include <opencv2/core.hpp>
 
 #include <cstddef>
@@ -145,6 +147,28 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
         }
 
         auto rank = inShape.size();
+
+        /* We can do a copy if the reduced rank is two and only the first axis is sliced.
+         * The general requirement is that only one axis is sliced and all the axes that
+         * preceed the sliced axis are singleton. However, the reductions above will remove
+         * all the leading singleton axes and merge the trailing unsliced axes into one or
+         * zero if there are no trailing unsliced axes. The latter case is handled later
+         * separately.
+         */
+        if (rank == 2 && offsets[0] != 0 && offsets[1] == 0)
+        {
+            auto stride = inShape[1];
+            auto sliced_input = View<T>(input.get() + offsets[0] * stride, output.size());
+            kernels::copy<T>(stream, output, sliced_input);
+            return;
+        }
+
+        if (rank == 1)
+        {
+            auto sliced_input = View<T>(input.get() + offsets[0], output.size());
+            kernels::copy<T>(stream, output, sliced_input);
+            return;
+        }
 
         std::vector<std::size_t> inStride(rank), outStride(rank);
         inStride.back() = 1;
