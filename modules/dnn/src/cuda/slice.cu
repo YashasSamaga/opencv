@@ -81,6 +81,13 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
         CV_Assert(output.rank() == input.rank());
         CV_Assert(output.rank() == offsets.size());
 
+        if (is_shape_same(output, input))
+        {
+            CV_Assert(std::all_of(std::begin(offsets), std::end(offsets), [] (std::size_t x) { return x == 0; }));
+            kernels::copy<T>(stream, output, input);
+            return;
+        }
+
         /* squeezable axes at the beginning of both tensors can be eliminated
          *
          * Reasoning:
